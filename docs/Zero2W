@@ -1,0 +1,111 @@
+hideo_81_g@zero2w-2nd:~/pipulse $ cat /home/hideo_81_g/pipulse/main.py
+import time
+import subprocess
+import os
+from datetime import datetime, timezone, timedelta
+from core.clock import ClockManager
+from core.power import PowerManager
+from core.sensor import SensorManager
+from core.storage import StorageManager
+from core.fail_safe import monitor_loop
+
+JST = timezone(timedelta(hours=9), 'JST')
+
+def main():
+    print("==================================================")
+    print("🚢 浮沈艦2nd：脈動システム（PiPulse）4Bハイブリッド起動")
+    print("==================================================")
+    
+    clock = ClockManager()
+    power = PowerManager()
+    sensor = SensorManager()
+    storage = StorageManager()
+
+    print("⏳ システムの安定待ち中（2秒）...")
+    time.sleep(2)
+
+    prev_batt_pct = None
+    status = 200       
+    error_occurred = False
+
+    try:
+        ts = clock.get_timestamp()
+        print(f"\n[🕒 {ts}] ── 定期観測フェーズ開始 ──")
+        
+        print("🔋 バッテリー計測中（3秒間お待ちください）...")
+        batt_pct = power.get_median_pct()
+        batt_mv = power.get_raw_mv()
+        
+        print("📡 センサー読み取り中...")
+        try:
+            temp, hum, press = sensor.read_data()
+        except Exception as e:
+            print(f"⚠️ センサー読み取り失敗: {e}")
+            temp, hum, press = "NaN", "NaN", "NaN"
+            error_occurred = True
+        
+        record_for_fs = {
+            "batt_pct_med": batt_pct,
+            "status": status,
+            "ntp_offset": 0.0
+        }
+        alert = monitor_loop(record_for_fs, error_occurred=error_occurred, prev_batt_pct=prev_batt_pct)
+        
+        # 1. RAM(/tmp)への書き込み（月次ログファイルのパスだけを受け取る）
+        ram_monthly_path = storage.write_row(ts, batt_pct, batt_mv, temp, hum, press, status, alert)
+
+        # 2. 【2nd専用：最新1行カスタム】人間がスマホで一発で見れるテキストを生成
+        alert_str = "🚨アラート!" if alert else "正常"
+        readable_line = (
+            f"【最新観測】時刻:{ts} | "
+            f"温度:{temp}℃ | 湿度:{hum}% | 気圧:{press}hPa | "
+            f"電池:{batt_pct}% ({batt_mv}mV) | "
+            f"Wi-Fi:{storage._get_wifi_rssi()}dBm | "
+            f"状態:{status} ({alert_str})"
+        )
+
+        # RAMディスク上に「1行だけの最新テキストファイル」として上書き保存
+        readable_txt_path = "/tmp/pipulse/latest_pipulse.txt"
+        with open(readable_txt_path, "w", encoding="utf-8") as f:
+            f.write(readable_line + "\n")
+
+        # ☁️ ① 【毎回実行：15分おき】最新の1行テキストを爆速上書き同期！
+        print("☁️ Googleドライブへ【最新の1行ステータス】を爆速上書き中...")
+        try:
+            subprocess.run([
+                "rclone", "copy", 
+                readable_txt_path, 
+                "gdrive:/sensor_data/", 
+                "--checksum", 
+                "--no-traverse"
+            ], check=True)
+            print("✅ 最新1行テキストのクラウド上書き大成功！")
+            print(f"👀 送信内容: {readable_line}")
+        except Exception as e:
+            print(f"❌ 最新データのクラウド同期失敗: {e}")
+
+        # 💾 ② 【条件実行：4時間おき】時計の判定はstorage側に一任
+        if storage.flush_ram_to_sd():
+            print("☁️ Googleドライブへ【今月の全履歴】をガチ同期中...")
+            try:
+                subprocess.run([
+                    "rclone", "copy", 
+                    ram_monthly_path, 
+                    "gdrive:/sensor_data/", 
+                    "--checksum", 
+                    "--no-traverse"
+                ], check=True)
+                print("✅ 全履歴のクラウド同期が大成功しました！")
+            except Exception as e:
+                print(f"❌ 全履歴のクラウド同期失敗: {e}")
+        else:
+            print("⏭️ 全履歴の同期タイミングではないため、今回はスキップします（省エネ運用中）。")
+
+    except Exception as e:
+        print(f"❌ 予期せぬ致命的エラー: {e}")
+    
+    print("🏁 ミッション完了。プログラムを完全終了し、システムを深い休眠へ移行します。")
+
+if __name__ == "__main__":
+    main()
+hideo_81_g@zero2w-2nd:~/pipulse $ 
