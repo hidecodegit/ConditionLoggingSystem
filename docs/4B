@@ -1,0 +1,129 @@
+hideo_81_g@raspberrypi:~ $ tree
+.
+ââ€â€ backup_pipulse.tar.gz
+ââ€â€ Bookshelf
+âÂ Â  ââ€â€ The_Official_Raspberry_Pi_Beginners_Guide_5th_Edition.pdf
+ââ€â€ Desktop
+ââ€â€ Documents
+ââ€â€ Downloads
+ââ€â€ home
+âÂ Â  ââ€â€ hideo_81_g
+ââ€â€ logs
+âÂ Â  ââ€â€ cron.log
+âÂ Â  ââ€â€ cron_sensor.log
+âÂ Â  ââ€â€ deploy.log
+âÂ Â  ââ€â€ runner.log
+âÂ Â  ââ€â€ sensor_copier.log
+âÂ Â  ââ€â€ sensor_copier_v2.log
+âÂ Â  ââ€â€ sensor_copier_v3.log
+âÂ Â  ââ€â€ sensor_copier_v4.log
+âÂ Â  ââ€â€ sensor_copier_v5.log
+âÂ Â  ââ€â€ sensor_copier_v6.log
+âÂ Â  ââ€â€ sensor_copier_v6.log.1
+âÂ Â  ââ€â€ sensor_copier_v6.log.2
+âÂ Â  ââ€â€ sensor_copier_v6.log.3
+âÂ Â  ââ€â€ sensor_sync.log
+ââ€â€ Music
+ââ€â€ Pictures
+ââ€â€ Public
+ââ€â€ sensor_data
+âÂ Â  ââ€â€ last_full_sync.json
+âÂ Â  ââ€â€ latest_temp_humid.txt
+âÂ Â  ââ€â€ temp_humid_2025-08.txt
+âÂ Â  ââ€â€ temp_humid_2025-09.txt
+âÂ Â  ââ€â€ temp_humid_2025-12.txt
+âÂ Â  ââ€â€ temp_humid_2026-01.txt
+âÂ Â  ââ€â€ temp_humid_2026-02.txt
+âÂ Â  ââ€â€ temp_humid_2026-03.txt
+âÂ Â  ââ€â€ temp_humid_2026-04.txt
+âÂ Â  ââ€â€ temp_humid_2026-05.txt
+âÂ Â  ââ€â€ temp_humid_2026-06.txt
+âÂ Â  ââ€â€ temp_humid_2026-07.txt
+ââ€â€ Templates
+ââ€â€ Videos
+ââ€â€ workspace
+    ââ€â€ 20210501_vampire.py
+    ââ€â€ 20210503_game.py
+    ââ€â€ 20210507_swordfish.py
+    ââ€â€ 20210507_yourName2.py
+    ââ€â€ 20210507_yourName.py
+    ââ€â€ 20210509_exitExample.py
+    ââ€â€ 20210509_fivetimes_b.py
+    ââ€â€ 20210509_fivetimes.py
+    ââ€â€ 20210509_printRandom.py
+    ââ€â€ 20210511_hellofunc2.py
+    ââ€â€ 20210511_hellofunc.py
+    ââ€â€ 20210511_magic8Ball.py
+    ââ€â€ 20210512_sameName2.py
+    ââ€â€ 20210512_sameName.py
+    ââ€â€ 20210513_guessTheNumber.py
+    ââ€â€ 20210513_sameName3.py
+    ââ€â€ 20210513_sameName4.py
+    ââ€â€ 20210513_zeroDivide1.py
+    ââ€â€ 20210513_zeroDivide.py
+    ââ€â€ 20210522_allMyCats1.py
+    ââ€â€ 20210522_allMyCats2.py
+    ââ€â€ 20210522_magic8Ball2.py
+    ââ€â€ 20210522_myPets.py
+    ââ€â€ 20210522_test.py
+    ââ€â€ 20210524_birthdays.py
+    ââ€â€ 20210524_passingReference.py
+    ââ€â€ 20210525_characterCount.py
+    ââ€â€ 20210525_prettyCharacterCount.py
+    ââ€â€ 20210525_ticTacToe.py
+    ââ€â€ 20210529_catnapping.py
+    ââ€â€ 20210601_picnicTable.py
+    ââ€â€ 20210601_validateInput.py
+    ââ€â€ 20210602_pw.py
+    ââ€â€ 20210803_01_blinkLed_a.py
+    ââ€â€ 20210803_02_buttonControlLed_a.py
+    ââ€â€ 20210803_03_8Led_a.py
+    ââ€â€ 20210809_04_breathLed_a.py
+    ââ€â€ 20210809_05_rgb_a.py
+    ââ€â€ 20220321_minecraft.py
+    ââ€â€ 20220417_pw.py
+    ââ€â€ 20220618_stack_1.py
+    ââ€â€ 20240707_aht25.py
+    ââ€â€ 20240717_aht25.py
+    ââ€â€ 20240721 data
+    ââ€â€ 20240722_aht25.py
+    ââ€â€ 20250713_smalltext
+    ââ€â€ 20250714_ToGdrive.py
+    ââ€â€ 20250723_3_ToGdrive.py
+    ââ€â€ 20250723_ToGdrive.py
+    ââ€â€ 20250724_ToGdrive.py
+    ââ€â€ 20250725_ToGdrive.py
+    ââ€â€ 20250726_ToGdrive.py
+    ââ€â€ 20250727_ToGdrive.py
+    ââ€â€ 20250728_ToGdrive.py
+    ââ€â€ 20250823_LatestToGdrive.py
+    ââ€â€ 20250824_LatestToGdrive_fixed.py
+    ââ€â€ 20250824_LatestToGdrive.py
+    ââ€â€ 20250825_LatestToGdrive.py
+    ââ€â€ 20250901_LatestToGdrive.py
+    ââ€â€ 20250921_LatestToGdrive_LogMin.py
+    ââ€â€ 20250922_LatestToGdrive.py
+    ââ€â€ 20251001_LatestToGdrive.py
+    ââ€â€ 20251013_LatestToGdrive.py
+    ââ€â€ 20251019_SensorSync.py
+    ââ€â€ 20251020_SensorSync.py
+    ââ€â€ 20251022_SensorCopier.py
+    ââ€â€ 20251213_SensorCopier_v2.py
+    ââ€â€ convert_time.py
+    ââ€â€ graph.py
+    ââ€â€ import.py
+    ââ€â€ SensorCopier_current.py -> sensor_copier_v6_20251230.py
+    ââ€â€ sensor_copier_v3_20251220.py
+    ââ€â€ sensor_copier_v4_20251221.py
+    ââ€â€ sensor_copier_v5_20251228.py
+    ââ€â€ sensor_copier_v5_20251230.py
+    ââ€â€ sensor_copier_v6_20251230.py
+    ââ€â€ SensorSync.py
+    ââ€â€ temp10times.py
+    ââ€â€ temperature.py
+    ââ€â€ temp_humid.txt
+    ââ€â€ temp.py
+    ââ€â€ test.py
+
+15 directories, 110 files
+hideo_81_g@raspberrypi:~ $ 
