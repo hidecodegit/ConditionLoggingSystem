@@ -126,7 +126,7 @@ hideo_81_g@raspberrypi:~ $ tree
     ââ€â€ test.py
 
 15 directories, 110 files
-hideo_81_g@raspberrypi:~ $ 
+
 
 hideo_81_g@raspberrypi:~/workspace $ cat SensorCopier_current.py
 #!/usr/bin/env python3
@@ -782,3 +782,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
