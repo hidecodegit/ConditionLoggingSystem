@@ -109,3 +109,402 @@ def main():
 if __name__ == "__main__":
     main()
 hideo_81_g@zero2w-2nd:~/pipulse $ 
+
+hideo_81_g@zero2w-2nd:~/pipulse $ cd core
+hideo_81_g@zero2w-2nd:~/pipulse/core $ cat ./clock.py
+import time
+from datetime import datetime, timedelta
+
+class ClockManager:
+    def get_timestamp(self):
+        """FDD仕様：CSVの1列目に記録する標準フォーマットの時刻を返す"""
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def calc_wait_seconds(self, interval_minutes=15):
+        """
+        FOD/FDD思想：次の15分境界（00, 15, 30, 45分）までの正確な残り秒数を計算する。
+        これにより、間欠運用が15分ジャストのタイミングに完全同期する。
+        """
+        now = datetime.now()
+        
+        # 次の境界時間を計算
+        minutes_to_add = interval_minutes - (now.minute % interval_minutes)
+        next_time = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
+        
+        # 残り秒数を算出（最低でも1秒は待つ安全弁付き）
+        wait_seconds = (next_time - now).total_seconds()
+        return max(float(wait_seconds), 1.0)
+hideo_81_g@zero2w-2nd:~/pipulse/core $ cat ./power.py
+import time
+import smbus2
+
+class PowerManager:
+    MCU_ADDR = 0x57
+    REG_BATT_PCT = 0x2a
+    
+    # 【解析結果】レジスタの仕様に合わせて1バイトずつ明示的にアドレスを指定
+    REG_BATT_MV_L = 0x22  # 下位バイト (もし左右逆ならここが上位)
+    REG_BATT_MV_H = 0x23  # 上位バイト
+    I2C_BUS_NUM = 1
+
+    def get_median_pct(self):
+        samples = []
+        try:
+            bus = smbus2.SMBus(self.I2C_BUS_NUM)
+            for _ in range(3):
+                val = bus.read_byte_data(self.MCU_ADDR, self.REG_BATT_PCT)
+                if 0 <= val <= 100:
+                    samples.append(val)
+                time.sleep(1)
+            bus.close()
+            return sorted(samples)[1] if len(samples) >= 3 else (samples[0] if samples else "NaN")
+        except Exception:
+            return "NaN"
+
+    def get_raw_mv(self):
+        """
+        【バグ修正版】乱高下する10V単位のバグを修正
+        ブロック読み込みを廃止し、エンディアン判定を修正して正しいミリボルトを合成します
+        """
+        try:
+            bus = smbus2.SMBus(self.I2C_BUS_NUM)
+            
+            # 安全のため1バイトずつ確実に読み出す
+            low_byte = bus.read_byte_data(self.MCU_ADDR, self.REG_BATT_MV_L)
+            
+            # もし0x23が存在する仕様なら読み出す。なければブロックデータの挙動から推測
+            try:
+                high_byte = bus.read_byte_data(self.MCU_ADDR, self.REG_BATT_MV_H)
+            except Exception:
+                # 連続読み出ししかできないチップだった場合のフォールバック
+                data = bus.read_i2c_block_data(self.MCU_ADDR, self.REG_BATT_MV_L, 2)
+                low_byte, high_byte = data[0], data[1]
+                
+            bus.close()
+            
+            # 🕵️‍♂️ マスターの解析に基づく「真のビッグエンディアン合成」
+            # 固定値だったlow_byte(0x0E)を上位に、変動していたhigh_byteを下位に結合
+            mv = (low_byte << 8) | high_byte
+            
+            # 計算された値が現実的なバッテリー電圧（2500mV〜5000mV）の範囲内かチェック
+            if 2500 <= mv <= 5000:
+                return mv
+            
+            # もし元のリトルエンディアンが正しくて、ただの寝起きノイズだった場合の保険
+            alternative_mv = (high_byte << 8) | low_byte
+            if 2500 <= alternative_mv <= 5000:
+                return alternative_mv
+                
+            return mv # どちらの範囲にも入らない場合はそのまま返す
+            
+        except Exception:
+            return "NaN"
+hideo_81_g@zero2w-2nd:~/pipulse/core $ cat ./sensor.py
+import time
+import smbus2
+
+class SensorManager:
+    ADDRESS = 0x76
+    I2C_BUS_NUM = 1
+
+    def __init__(self):
+        # 補正パラメーター（トリミングデータ）の保持用変数
+        self.dig_T = []
+        self.dig_P = []
+        self.dig_H = []
+
+    def _load_calibration(self, bus):
+        """センサー内部の固有補正値を読み出す（初回のみ）"""
+        if self.dig_T:  # すでに読み込み済みならスキップ
+            return
+
+        # 温度・気圧の補正値（0x88 〜 0xA1）
+        cal1 = bus.read_i2c_block_data(self.ADDRESS, 0x88, 26)
+        self.dig_T.append((cal1[1] << 8) | cal1[0]) # dig_T1 (unsigned)
+        self.dig_T.append(self._to_signed(cal1[3] << 8 | cal1[2]))
+        self.dig_T.append(self._to_signed(cal1[5] << 8 | cal1[4]))
+
+        for i in range(1, 10):
+            idx = 4 + i * 2
+            if i == 1: # dig_P1 (unsigned)
+                self.dig_P.append((cal1[idx+1] << 8) | cal1[idx])
+            else:
+                self.dig_P.append(self._to_signed(cal1[idx+1] << 8 | cal1[idx]))
+
+        # 湿度の補正値（0xA1, 0xE1 〜 0xE7）
+        self.dig_H.append(bus.read_byte_data(self.ADDRESS, 0xA1)) # dig_H1
+        cal2 = bus.read_i2c_block_data(self.ADDRESS, 0xE1, 7)
+        self.dig_H.append(self._to_signed(cal2[1] << 8 | cal2[0])) # dig_H2
+        self.dig_H.append(cal2[2]) # dig_H3
+        self.dig_H.append(self._to_signed((cal2[3] << 4) | (cal2[4] & 0x0F))) # dig_H4
+        self.dig_H.append(self._to_signed((cal2[5] << 4) | (cal2[4] >> 4)))   # dig_H5
+        self.dig_H.append(self._to_signed(cal2[6])) # dig_H6
+
+    def _to_signed(self, val, bits=16):
+        """補正値を符号付き整数に変換するヘルパー"""
+        if val & (1 << (bits - 1)):
+            val -= 1 << bits
+        return val
+
+    def read_data(self):
+        """温湿度・気圧を測定して物理値に変換して返す"""
+        try:
+            # FOD準拠：リソースリーク防止のため毎回バスを開閉
+            bus = smbus2.SMBus(self.I2C_BUS_NUM)
+            self._load_calibration(bus)
+
+            # === 🔥 Grok先輩推奨：BME280の湿度センサーを叩き起こす呪文 ===
+            # 1. まず湿度設定（ctrl_hum: 0xF2）に 0x01（オーバーサンプリング 1x）を書き込む
+            bus.write_byte_data(self.ADDRESS, 0xF2, 0x01)
+            
+            # 2. 次に温度・気圧設定＋Forced Mode（ctrl_meas: 0xF4）に 0x25 を書き込む
+            # これにより、上の0xF2の設定がセンサー内部でカチッと有効化されます
+            bus.write_byte_data(self.ADDRESS, 0xF4, 0x25)
+            
+            # 3. 測定が完全に完了するまで少し長め（100ms）に待つ
+            time.sleep(0.1)
+
+            # 4. データブロック（0xF7〜0xFE）の8バイトを一気に読み出す
+            data = bus.read_i2c_block_data(self.ADDRESS, 0xF7, 8)
+            bus.close() # 読み終えたら即クローズ（固着防止）
+
+            # ビット結合（生データ分解）
+            pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
+            temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
+            hum_raw  = (data[6] << 8) | data[7]
+
+            # 3. Bosch公式の補正計算（温度）
+            var1 = ((((temp_raw >> 3) - (self.dig_T[0] << 1))) * (self.dig_T[1])) >> 11
+            var2 = (((((temp_raw >> 4) - (self.dig_T[0])) * ((temp_raw >> 4) - (self.dig_T[0]))) >> 12) * (self.dig_T[2])) >> 14
+            t_fine = var1 + var2
+            temperature = float(((t_fine * 5) + 128) >> 8) / 100.0
+
+            # 4. Bosch公式の補正計算（気圧）
+            var1 = (t_fine >> 1) - 64000
+            var2 = (((var1 >> 2) * (var1 >> 2)) >> 11) * self.dig_P[5]
+            var2 = var2 + ((var1 * self.dig_P[4]) << 1)
+            var2 = (var2 >> 2) + (self.dig_P[3] << 16)
+            var1 = (((self.dig_P[2] * (((var1 >> 2) * (var1 >> 2)) >> 13)) >> 3) + ((self.dig_P[1] * var1) >> 1)) >> 18
+            var1 = ((32768 + var1) * self.dig_P[0]) >> 15
+            
+            if var1 == 0:
+                pressure = "NaN"
+            else:
+                p = (((1048576 - pres_raw) - (var2 >> 12))) * 3125
+                if p < 0x80000000:
+                    p = (p << 1) // var1
+                else:
+                    p = (p // var1) * 2
+                var1 = (self.dig_P[8] * (((p >> 3) * (p >> 3)) >> 13)) >> 12
+                var2 = (((p >> 2)) * self.dig_P[7]) >> 13
+                pressure = float(p + ((var1 + var2 + self.dig_P[6]) >> 4)) / 100.0
+
+            # 5. Bosch公式の補正計算（湿度）
+            v_x1_u32r = t_fine - 76800
+            v_x1_u32r = (((((hum_raw << 14) - (self.dig_H[3] << 20) - (self.dig_H[4] * v_x1_u32r)) + 16384) >> 15) *
+                         (((((((v_x1_u32r * self.dig_H[5]) >> 10) * (((v_x1_u32r * self.dig_H[2]) >> 11) + 32768)) >> 10) + 2097152) * self.dig_H[1] + 8192) >> 14))
+            v_x1_u32r = v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) * self.dig_H[0]) >> 4)
+            v_x1_u32r = 0 if v_x1_u32r < 0 else v_x1_u32r
+            v_x1_u32r = 419430400 if v_x1_u32r > 419430400 else v_x1_u32r
+            humidity = float(v_x1_u32r >> 12) / 1024.0
+
+            # 小数点第2位までに丸めて返す
+            return round(temperature, 2), round(humidity, 2), round(pressure, 2)
+
+        except Exception:
+            return "NaN", "NaN", "NaN"
+hideo_81_g@zero2w-2nd:~/pipulse/core $ cat ./storage.py
+import os
+import subprocess
+import re
+import json
+from datetime import datetime, timezone, timedelta
+
+# JST強制
+JST = timezone(timedelta(hours=9), 'JST')
+
+class StorageManager:
+    def __init__(self, ram_dir="/tmp/pipulse", sd_dir="/home/hideo_81_g/sensor_data"):
+        """
+        4B先輩ハイブリッド仕様：
+        15分おきの超高速・省エネ書き込みは ram_dir (/tmp) を使用。
+        4時間おきの永続バックアップ先として sd_dir (SDカード) を保持。
+        """
+        self.ram_dir = ram_dir
+        self.sd_dir = sd_dir
+        
+        os.makedirs(self.ram_dir, exist_ok=True)
+        os.makedirs(self.sd_dir, exist_ok=True)
+
+    def _get_ram_monthly_filepath(self):
+        """RAM上の今月の全履歴ファイルパスを取得"""
+        month_str = datetime.now(JST).strftime("%Y-%m")
+        return os.path.join(self.ram_dir, f"pipulse_{month_str}.txt")
+
+    def _get_wifi_rssi(self):
+        try:
+            res = subprocess.check_output(["iwconfig", "wlan0"], text=True)
+            match = re.search(r"Signal level=(-?\d+)\s+dBm", res)
+            if match:
+                return int(match.group(1))
+            return None
+        except Exception:
+            return None
+
+    def _get_ntp_offset(self):
+        try:
+            res = subprocess.check_output(["timedatectl", "timesync-status"], text=True, timeout=2)
+            match = re.search(r"Offset:\s+([-+]?\d+\.\d+)(ms|s)", res)
+            if match:
+                val = float(match.group(1))
+                unit = match.group(2)
+                return val / 1000.0 if unit == "ms" else val
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def flush_ram_to_sd(self):
+        """
+        自律判定型DataFlusher:
+        4時間おき（0時, 4時, 8時, 12時, 16時, 20時の0分〜15分の間）の場合のみ、
+        RAM領域のデータをSDカードへrsyncで安全に同期する。
+        条件に合わない場合は何もしきせずに False を返す。
+        """
+        now = datetime.now(JST)
+        if not (now.hour % 4 == 0 and 0 <= now.minute < 15):
+            return False
+
+        print(f"⏰ 4時間おき（現在 {now.hour}時）のフル同期タイミングに到達しました。")
+        print(f"💾 DataFlusher: RAM ({self.ram_dir}) から SDカード ({self.sd_dir}) へ退避中...")
+        try:
+            subprocess.run(["rsync", "-a", self.ram_dir + "/", self.sd_dir + "/"], check=True)
+            print("💾 SDカードへのバックアップ完了！")
+            return True
+        except Exception as e:
+            print(f"❌ SDカードへのバックアップ失敗: {e}")
+            return False
+
+    def write_row(self, timestamp, batt_pct, batt_mv, temp, hum, press, status, alert):
+        """
+        RAM上の月替わりファイルにデータを追記し、そのファイルパスを返す。
+        """
+        wifi_rssi = self._get_wifi_rssi()
+        ntp_offset = self._get_ntp_offset()
+
+        data_dict = {
+            "timestamp": str(timestamp),
+            "batt_pct": batt_pct if batt_pct != "NaN" else None,
+            "batt_mv": batt_mv if batt_mv != "NaN" else None,
+            "temp": temp if temp != "NaN" else None,
+            "hum": hum if hum != "NaN" else None,
+            "press": press if press != "NaN" else None,
+            "wifi_rssi": wifi_rssi,
+            "ntp_offset": ntp_offset, 
+            "status": int(status),
+            "alert_flag": 1 if alert else 0
+        }
+
+        # 1. RAM上のファイルパスを取得
+        ram_monthly_path = self._get_ram_monthly_filepath()
+
+        # 2. RAM上のファイルに追記
+        with open(ram_monthly_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data_dict, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        print(f"📝 RAMへ書き込み完了: {data_dict}")
+
+        return ram_monthly_path
+hideo_81_g@zero2w-2nd:~/pipulse/core $ cat ./fail_safe.py
+# core/fail_safe.py
+# フェイルセーフ監視（アラート専用）
+# 実挙動を変えず、前兆だけログに残す
+# ログがうるさいと感じたら、不要なチェックをコメントアウトで調整
+# 異常時は alert_flag を立て、main.pyでCSVに反映
+
+import time
+import logging
+import psutil
+from collections import defaultdict
+
+logger = logging.getLogger("fail_safe")
+_counters = defaultdict(int)
+_last_loop_time = time.time()
+
+def check_loop_delay(current_time):
+    global _last_loop_time
+    delay = current_time - _last_loop_time
+    if delay > 1200:  # 20分以上
+        logger.warning(f"Loop delay exceeded: {delay/60:.1f} min")
+        return True
+    _last_loop_time = current_time
+    return False
+
+def check_memory_usage():
+    mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+    if mem_mb > 100:
+        logger.warning(f"Memory usage high: {mem_mb:.1f} MB")
+        return True
+    return False
+
+def check_i2c_error_count(error_occurred: bool):
+    if error_occurred:
+        _counters["i2c_error"] += 1
+        if _counters["i2c_error"] >= 5:
+            logger.warning(f"I2C read error consecutive: {_counters['i2c_error']} times")
+            return True
+    else:
+        _counters["i2c_error"] = 0
+    return False
+
+def check_ntp_offset(offset):
+    if offset is not None and abs(offset) > 60:
+        logger.warning(f"NTP offset extreme: {offset:+.3f} seconds")
+        return True
+    return False
+
+def check_battery_drop(current_pct, prev_pct):
+    if prev_pct is not None and prev_pct - current_pct > 20:
+        logger.warning(f"Battery sudden drop: -{prev_pct - current_pct}%")
+        return True
+    return False
+
+def check_send_failure(status):
+    if status == -1:
+        _counters["send_fail"] += 1
+        if _counters["send_fail"] >= 3:
+            logger.warning(f"Send failure consecutive: {_counters['send_fail']} times")
+            return True
+    else:
+        _counters["send_fail"] = 0
+    return False
+
+def monitor_loop(record, error_occurred=False, prev_batt_pct=None):
+    alert = False
+
+    alert |= check_loop_delay(time.time())
+    alert |= check_memory_usage()
+    alert |= check_i2c_error_count(error_occurred)
+    alert |= check_ntp_offset(record.get("ntp_offset"))
+    alert |= check_battery_drop(record.get("batt_pct_med"), prev_batt_pct)
+    alert |= check_send_failure(record.get("status"))
+
+    return alert
+hideo_81_g@zero2w-2nd:~/pipulse/core $ cat /etc/systemd/system/pipulse.service
+[Unit]
+Description=PiPulse Sensor Logger Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ExecStartPre=/bin/sleep 15
+Type=oneshot
+User=hideo_81_g
+WorkingDirectory=/home/hideo_81_g/pipulse
+ExecStart=/usr/bin/python3 /home/hideo_81_g/pipulse/main.py
+
+[Install]
+WantedBy=multi-user.target
+hideo_81_g@zero2w-2nd:~/pipulse/core $ crontab -l
+no crontab for hideo_81_g
+hideo_81_g@zero2w-2nd:~/pipulse/core $ 
