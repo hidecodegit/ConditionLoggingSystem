@@ -122,3 +122,54 @@ Googleドライブ上には、Zero 2 W側が出力するJSON風テキスト形�
 | **① ステージング**<br>(Zero 2 W ➡️ 4B NFS) | **個別ログ (Before互換テキスト)** | `timestamp, cpu_temp, battery_mv, rssi` | **【Zeroの変更は最小限】**<br>rcloneを完全に排除し、生のテキストデータをLAN内直送するだけで負荷極小。 |
 | **② 構造化・統合**<br>(4Bローカル ➡️ SQLite3) | **DBスキーマ (構造化)** | `datetime(PK), cpu_temp, battery_mv, rssi, room_temp, room_humi` | **【4B内でガッチャンコ】**<br>Zeroのシステムデータと4Bの環境データを, 時間軸をピッタリ合わせて1レコードに結合。 |
 | **③ 可視化パブリッシュ**<br>(4B ➡️ クラウド) | ✨ **統一レポート形式**<br>(統合CSV / スプレッドシート) | `日時, 端末温度, 電池残量, 電波強度, 部屋温度, 部屋湿度` | **【スマホ閲覧の最適化】**<br>マスターがスマホで開いた瞬間に、すべてのコンディションが一画面で把握可能。 |
+
+
+### ▪️システム構成図
+graph TD
+    subgraph Zero2W["子機: Raspberry Pi Zero 2 W"]
+        Sensor["環境センサー<br/>(温湿度・気圧)"]
+    end
+
+    subgraph RPi4B["親機: Raspberry Pi 4B (192.168.0.19)"]
+        Flask["Flask Web API<br/>(app.py :8000)"]
+        DB[("SQLite DB<br/>(WALモード)")]
+    end
+
+    Sensor -->|"HTTP POST (JSON)<br/>X-API-Key"| Flask
+    Flask -->|"SQL INSERT"| DB
+
+### ▪️処理シーケンス図
+sequenceDiagram
+    autonumber
+    participant Z as Zero 2 W (子機)
+    participant F as Flask App (4B)
+    participant DB as SQLite DB
+
+    Z->>F: POST /api/v1/zero2w (JSON + API Key)
+    activate F
+    
+    alt 認証成功 (API Key一致)
+        F->>F: JST時刻 (received_at) 付与
+        F->>DB: INSERT (zero2w_logs)
+        F-->>Z: 200 OK (success)
+    else 認証エラー
+        F-->>Z: 403 Forbidden
+    end
+    
+    deactivate F
+
+### ▪️データ構造図
+erDiagram
+    zero2w_logs {
+        INTEGER id PK
+        TEXT device_id
+        TEXT timestamp
+        REAL temperature
+        REAL humidity
+        REAL pressure
+        REAL battery_voltage
+        REAL battery_percent
+        INTEGER wifi_rssi
+        TEXT status_code
+        TEXT received_at
+    }
