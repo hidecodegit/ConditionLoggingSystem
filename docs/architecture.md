@@ -1,175 +1,196 @@
-# システムアーキテクチャ設計書 (System Architecture Design Specification)
+# システムアーキテクチャ設計書（Flask版）
 
-本ドキュメントは、分散型コンディションロギングシステム（Condition Logging System）における、ハードウェア、ソフトウェア、およびデータパイプラインの基本設計について定義する。
+本ドキュメントは、ConditionLoggingSystem の現行アーキテクチャ（2026-07時点）を定義する。
 
 ---
 
-## 1. 開発背景とアーキテクチャ選定
-従来の運用では、シングルエッジ端末（Raspberry Pi Zero 2 W）に「センサー計測」「ローカルデータ蓄積」「クラウドへの暗号化通信（rclone）」の全タスクを集中させていた。しかし、メモリリソースの逼迫（416MiB）とWi-Fiの瞬断が引き金となり、端末のハングアップ（サイレント・デス）が頻発する課題を抱えていた。
+## 1. 開発背景とアーキテクチャ変遷
 
-この課題を根本から解決するため、本システムでは、物理的なハードウェア資源と役割を完全に分離した **「2-Tier（二層）分散アーキテクチャ」** を採用する。
+### 従来の課題（1-Tier / rclone直送時代）
 
-## 1.1 アーキテクチャ推移
-### ■ Before
+- Raspberry Pi Zero 2 W にセンサー計測・ローカル蓄積・クラウド送信を集中
+- メモリ逼迫（空き約74MiB）＋ rclone の負荷により **サイレント・デス** が頻発
+- 通信エラー時に重要テレメトリが消失
 
-本システムの構築に先立ち、Raspberry Pi 4B / Zero 2 W 単体による運用（1-Tier構成）を実施した。その際の構造は以下の通りである。
+### 現行アーキテクチャ（Flask + HTTP POST）
+
+役割を完全分離した **2-Tier 構成** に移行。
+
+- **子機（Zero 2 W）**: 計測専用。通信成功時はSD書き込みゼロ、失敗時のみローカルSQLite退避
+- **親機（Raspberry Pi 4B）**: 常駐Flaskサーバーで受信・集約・バックアップを担当
+
+---
+
+## 2. 全体構成図
+
+### Before（rclone直送時代）
 
 ```mermaid
 graph TD
-    Drive[☁️ Google Drive<br>個別バラバラの保管庫]
-    Pi4B[👑 RPi 4B<br>自端末のみ送信<br>メモリ3.1GiB]
-    AHT25[🌡️ AHT25<br>温湿度センサー]
-    
-    Zero2W[💻 RPi Zero 2 W<br>過負荷状態<br>メモリ416MiB]
-    BME280[📟 BME280<br>温湿度 / 大気圧センサー]
-    Metrics[🔋 システムメトリクス<br>バッテリ残量 / Wi-Fi強度]
-    
-    Death[💀 サイレント・デス<br>プロセスハング]
+    Drive["Google Drive"]
+    Pi4B["RPi 4B (自端末のみ送信)"]
+    AHT25["AHT25"]
+    Zero2W["RPi Zero 2 W (過負荷)"]
+    BME280["BME280"]
+    Metrics["Battery / RSSI"]
+    Death["Silent Death"]
 
-    %% 4B側の正常ルート
     AHT25 --> Pi4B
     Pi4B --> Drive
-
-    %% Zero2W側の破綻ルート
     BME280 --> Zero2W
     Metrics --> Zero2W
     Zero2W --> Drive
-
-    %% 障害によるデスの表現
     Zero2W --> Death
 ```
----
-
-### ■ After
-
-本システムは、以下の2つの階層（Tier）で構成される。
-
+### After（Flask版）
 ```mermaid
 graph TD
-    Drive[☁️ Google Drive<br>最終データ保管庫]
-    Pi4B[👑 RPi 4B Primary<br>Tier 2 : 集約・送信層<br>複数端末まとめて送信/超安定<br>rcloneによる外部暗号化通信を担当]
-    AHT25[🌡️ AHT25<br>温湿度センサー]
-    
-    Zero2W[💻 RPi Zero2W Secondary<br>Tier 1 : 計測・直送層<br>rclone全廃による徹底的な軽量化]
-    BME280[📟 BME280<br>温湿度 / 大気圧センサー]
-    Metrics[🔋 システムメトリクス<br>バッテリ残量 / Wi-Fi強度]
+    Drive["Google Drive"]
+    Pi4B["RPi 4B (Tier 2: Flask + SQLite)"]
+    AHT25["AHT25"]
+    Zero2W["RPi Zero 2 W (Tier 1: 計測専用)"]
+    BME280["BME280"]
+    Retry["retry_queue.db"]
 
-    %% データの流れ
     BME280 --> Zero2W
-    Metrics --> Zero2W
     AHT25 --> Pi4B
-
-    Zero2W -->|15分毎/軽量ローカル直送| Pi4B
-    Pi4B -->|データを統合して一括UP/安全な非同期処理| Drive
+    Zero2W -->|"HTTP POST (成功時)"| Pi4B
+    Zero2W -->|"失敗時"| Retry
+    Retry -->|"復旧後リトライ"| Pi4B
+    Pi4B -->|"rclone"| Drive
 ```
 
+## 3. データフロー詳細
+
+### 3.1 子機（Zero 2 W）処理フロー
+1. BME280 から温度・湿度・気圧を取得
+2. 親機へ HTTP POST を試行（`X-API-Key` ヘッダ付き）
+3. **成功時**: 何もローカルに残さず終了（SDカード保護）
+4. **失敗時**: `retry_queue.db` にレコードを退避
+5. 次回起動時または Wi-Fi 復旧検知時にリトライ
+
+### 3.2 親機（Raspberry Pi 4B）処理フロー
+1. Flask アプリがポート 8000 で常駐
+2. 受信リクエストに対して:
+   - `X-API-Key` 認証
+   - 簡易バリデーション
+   - `zero2w_logs` テーブルへ INSERT
+3. 別プロセス（15分ごと）で 4B 自身のセンサー測定（AHT25） → `rpi4b_logs` へ直接書き込み
+4. 定期的に `rclone` で Google Drive へバックアップ
+
+## 4. タイミングと同時書き込みについて
+
+Zero 2 W と 4B は **独立したタイマー** で動作しており、時刻同期は NTP 依存（完全同期ではない）。
+
+| パターン | 状況 | 影響 | 対策 |
+|---|---|---|---|
+| **どちらかが早い** | 時間差あり | ほぼなし | 特に不要 |
+| **どちらかが遅い** | 時間差あり | ほぼなし | 特に不要 |
+| **ほぼ同時** | 両書き込みが重なる | `SQLITE_BUSY` の可能性 | WAL + `busy_timeout` + 簡易リトライ |
+
+### 採用する最低限の防御策
+両書き込み経路（Flask受信・4B自測定）で共通して以下を適用する:
+
+```python
+conn = sqlite3.connect(db_path, timeout=10.0)
+conn.execute("PRAGMA journal_mode=WAL;")
+conn.execute("PRAGMA busy_timeout = 10000;")
+conn.execute("PRAGMA synchronous=NORMAL;")
+```
+
+書き込み時は短いトランザクションを使用する。
+これで「ほぼ同時」ケースでも実用上問題にならないレベルまで低減できる。
+### Note:
+書き込み専用プロセスへの完全集約は、現時点ではオーバースペックと判断し見送り。実運用で BUSY エラーが頻発する場合に再検討する。
+
+## 5. 主要コンポーネント一覧
+
+| コンポーネント | 場所 | 役割 | 使用技術 |
+|---|---|---|---|
+| **センサー読み取り** | Zero 2 W | BME280からデータ取得 | `smbus2` |
+| **ローカル退避** | Zero 2 W | 通信失敗時の安全保管 | SQLite3 (WAL) |
+| **送信クライアント** | Zero 2 W | 4Bへデータ送信 | `requests` / `urllib` |
+| **レシーバー** | 4B | データ受信窓口 | Flask |
+| **データベース** | 4B | 全データ一元集約 | SQLite3 (WAL) |
+| **4B自身の測定** | 4B | AHT25測定 → 直接DB書き込み | `smbus2` + `sqlite3` |
+| **クラウドバックアップ** | 4B | Googleドライブ同期 | `rclone` |
+
+## 6. 設計上の重要ポイント
+
+- **センサー構成**: Zero 2 W = BME280（温度・湿度・気圧） / 4B = AHT25（温度・湿度）
+- **SDカード保護**: 
+  - Zero 2 W → 成功時は書き込みゼロ（失敗時のみローカルSQLiteへ退避）
+  - 4B自炊データ → HTTPを経由せず直接DB書き込み（無駄なオーバーヘッド排除）
+- **DB安全性**: WALモード + `busy_timeout` + `synchronous=NORMAL` で同時書き込みに備える
+- **拡張性**: `device_id` カラムで複数子機を区別可能
+- **認証**: シンプルな `X-API-Key` 方式（同一LAN内運用を前提）
+- **耐障害性**: 通信断が発生してもデータ消失ゼロ
+- **システムメトリクス**: バッテリー・RSSI等は次ステップ（まずは3点連携を優先）
+
+## 7. データベース設計（概要）
+
+- **ファイル**: `/home/hideo_81_g/condition_logging/condition_logging.db`
+- **モード**: WAL（Write-Ahead Logging）
+
+### `zero2w_logs` テーブル
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | INTEGER | PRIMARY KEY 自動採番 |
+| `device_id` | TEXT | 端末識別子 |
+| `timestamp` | TEXT | 測定時刻 |
+| `temperature` | REAL | 温度 |
+| `humidity` | REAL | 湿度 |
+| `pressure` | REAL | 気圧 |
+| `battery_voltage` | REAL | バッテリー電圧（将来用） |
+| `battery_percent` | REAL | バッテリー残量（将来用） |
+| `wifi_rssi` | INTEGER | Wi-Fi強度（将来用） |
+| `status_code` | TEXT | ステータス |
+| `received_at` | TEXT | 4B受信時刻 |
+
+### `rpi4b_logs` テーブル
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| `id` | INTEGER | PRIMARY KEY 自動採番 |
+| `device_id` | TEXT | 端末識別子 |
+| `created_at` | TEXT | 測定時刻 |
+| `temperature` | REAL | 温度 |
+| `humidity` | REAL | 湿度 |
+
+## 8. 移行戦略（既存コード最小変更）
+
+### 基本方針
+- 測定ロジック（BME280 / AHT25）は一切触らない
+- 既存の cron / 起動方法は維持
+- 新しい経路（HTTP）を追加し、段階的に切り替える
+
+### フェーズ
+
+| Phase | 内容 | 状態 |
+|---|---|---|
+| **Phase 0** | 準備（ディレクトリ作成・IP確認・APIキー決定） | 完了 |
+| **Phase 1** | 4B側 Flaskレシーバー作成・systemd常駐化 | 進行中 |
+| **Phase 2** | Zero 2 W側 送信ロジックをHTTPに一発切り替え（失敗時ローカル退避） | 未着手 |
+| **Phase 3** | 動作確認・完成 | 未着手 |
+
+### 変更量のイメージ
+
+| 対象 | 変更の大きさ | 内容 |
+|---|---|---|
+| **4B SensorCopier** | ほぼゼロ | 触らない |
+| **4B 新規Flask** | 新規作成 | 受信専用 |
+| **Zero 2 W main.py / storage.py** | 小〜中 | 送信部分にHTTPを追加 |
+| **Zero 2 W 測定ロジック** | ゼロ | 触らない |
+
+## 9. 今後の実装優先順位
+
+1. 4B側 Flask レシーバーの systemd 常駐化完了
+2. Zero 2 W側 送信＋リトライキュー実装
+3. 4B自身の測定データを同じDBに統合（任意）
+4. rclone によるDBバックアップ整備
+5. システムメトリクス（バッテリー・RSSI）の追加
+6. 統合レポート・可視化（必要に応じて）
+
 ---
-
-## 1.2 システム運用環境・挙動比較表 (Before vs After)
-
-従来運用（Before）の課題と、新アーキテクチャ（After）における改善アプローチの対比は以下の通りである。
-
-| 評価項目 | Before: RPi Zero 2 W | Before: RPi 4B | ✨ After: 2-Tier 分散アーキテクチャ |
-| :--- | :--- | :--- | :--- |
-| **システムでの役割** | 現場での「センサー計測」から「クラウド直送」まで全担ぎ | 自端末の「センサー計測」および「クラウド直送」 | **【役割の完全分離】**<br>Zero 2 W：計測・LAN内直送のみ<br>4B：集約・DB保存・クラウド一括送信 |
-| **ハードウェア資源** | メモリ **416 MiB**<br>(実空き: 約74MiBの極限状態) | メモリ **3.8 GiB**<br>(実空き: 2.4GiBの超余裕) | 各端末の物理リソースを最適配置。<br>Zero 2 Wの負荷を極限まで引き下げ。 |
-| **タスク駆動方式** | `systemd-timer` (`pipulse.timer`)<br>15分間隔で起動 | `crontab`<br>`*/15 * * * *` (15分間隔) | **【非同期処理へ移行】**<br>Zero 2 W：15分毎にNFSへ直送<br>4B：ローカルで定期集約＆非同期UP |
-| **クラウド送信手段** | `Python` ➡️ `subprocess`経由で<br>`rclone copy` を外部プロセス起動 | `Python` ➡️ `crontab`経由で<br>`rclone` を実行 | **【Zero 2 Wのrclone全廃】**<br>4Bのみが内部でセキュアに `rclone` を叩き、一括パブリッシュを担当。 |
-| **主要ファイル名** | ・`pipulse_YYYY-MM.txt`<br>・`latest_pipulse.txt`<br>(JSON風テキストフォーマット) | ・`temp_humid_YYYY-MM.txt`<br>・`latest_temp_humid.txt`<br>(個別CSVフォーマット) | 📑 **【完全一本化】**<br>4BのSQLite3で時間軸を同期して結合。<br>**統一レポート形式**でクラウドへ転送。 |
-| **通信エラー時の挙動** | ❌ **サイレント・デス (フリーズ)**<br>OAuth2トークン更新時のWi-Fi瞬断でプロセスがハングアップ。 | ⭕️ **192日以上の連続安定稼働**<br>潤沢なメモリで通信エラーを完全許容。 | 🛠️ **【障害耐性の劇的向上】**<br>Zero 2 WはLAN内送信のみで超安定。<br>外回りのエラーは4Bがすべて吸収。 |
-| **データ生存性** | ❌ 接続エラー時にその場の最重要データ（電圧・RSSI等）が**全喪失**。 | 🔺 自端末の環境データのみローカル保護。 | ⭕️ ネットワーク遮断時も、4Bの**SQLite3へ確実にバッファ（蓄積）**され消失ゼロ。 |
-
----
-
-## 1.3 従来運用（単一端末アーキテクチャ）の技術的ボトルネック解析
-
-実機ログおよびリソース調査（`free -h`, `top`, `up 192 days`）から判明した、従来の1-Tier運用における構造的欠陥の解析結果は以下の通りである。
-
-### 1. エッジ端末（Zero 2 W）への暗号化・認証処理の集中と通信ブロック
-実機の空きメモリが常に `74MiB` 前後という極限状態において、15分間隔の駆動のたびにPythonからGo言語製の重厚な `rclone` プロセスを `subprocess` で外部呼び出ししていた。HTTPS暗号化計算（SSL/TLSハンドシェイク）とOAuth2トークンのリフレッシュ処理が一時的なメモリのスパイクを招き、Wi-Fiの微弱な瞬断が発生した瞬間に以下の通信エラーを吐いてプロセスがブロッキングされ、サイレント・デス（完全フリーズ）を引き起こしていた。
-> `Failed to create file system: couldn't fetch token - refresh with rclone config reconnect: Post ... connect: no route to host`
-
-### 2. ハードウェア資源の著しい不均衡と運用の非効率
-調査により、メインサーバーである RPi 4B はメモリを `2.4GiB` も残し、`192 days`（半年以上）もの連続安定稼働を平然と継続していることが判明した。その一方で、4Bは `crontab` 経由で自身の `temp_humid_*.txt` を送るのみであり、隣にあるZero 2 Wの悲鳴（リソース枯渇によるフリーズ）を物理的に救済できない「個別バラバラ送信」の構造的欠陥を抱えていた。
-
-### 3. エラーハンドリングの限界とデータ全喪失
-HTTPSの暗号化通信をエッジ端末（Zero 2 W）に直接持たせていたため、ネットワークに起因する例外が発生した際、死ぬ直前の最重要テレメトリ（Wi-Fi強度 `rssi` やバッテリー電圧 `battery_mv`）自体をクラウドに送り届けることも、ローカルに残すこともできず消失していた。
-
-### 4. データフォーマットの不統一と同期の欠如
-Googleドライブ上には、Zero 2 W側が出力するJSON風テキスト形式（`pipulse_*.txt`）と、4B側が出力するCSV形式（`temp_humid_*.txt`）が、それぞれ異なるフォーマット・異なるタイミングで同期なく配置されており、マスターがスマホ等で環境全体のコンディションを俯瞰する際の大きな妨げとなっていた。
-
----
-
-## 2. データフォーマット推移・比較 (Data Format Evolution)
-
-本システムにおける、各通信区間でのデータ形式（フォーマット）の Before / After 比較は以下の通りである。
-
-### ■ Before（従来：個別バラバラ送信）
-従来運用では、各端末がそれぞれのフォーマットで、かつ異なるタイミングで直接クラウドへ送信していた。
-
-| 送信元 ➡️ 送信先 | フォーマット形式 | データ項目の例 | 課題・特徴 |
-| :--- | :--- | :--- | :--- |
-| **RPi Zero 2 W**<br>➡️ クラウド | **個別ログ (JSON風テキスト)** | `timestamp, cpu_temp, battery_mv, rssi` | 単一端末のメトリクスのみ。Wi-Fi瞬断時に外部プロセス負荷でハングしデータ消滅。 |
-| **RPi 4B**<br>➡️ クラウド | **個別CSV (フラットテキスト)** | `timestamp, room_temp, room_humi` | 4Bが独自に測定した環境データのみ。Zero 2 Wのデータとは時間軸が同期していない。 |
-
----
-
-### ■ After（新アーキ：NFS直送 ➡️ SQLite統合 ➡️ 統一パブリッシュ）
-新アーキでは、Zero 2 WはBeforeの軽量ログ出力をそのまま活かしてNFSポストへ直送し、4B側でタイムスタンプをキーにして**完全な一本化（統一フォーマット化）**を行う。
-
-| 区間・フェーズ | フォーマット形式 | データ項目の例 | 役割・メリット |
-| :--- | :--- | :--- | :--- |
-| **① ステージング**<br>(Zero 2 W ➡️ 4B NFS) | **個別ログ (Before互換テキスト)** | `timestamp, cpu_temp, battery_mv, rssi` | **【Zeroの変更は最小限】**<br>rcloneを完全に排除し、生のテキストデータをLAN内直送するだけで負荷極小。 |
-| **② 構造化・統合**<br>(4Bローカル ➡️ SQLite3) | **DBスキーマ (構造化)** | `datetime(PK), cpu_temp, battery_mv, rssi, room_temp, room_humi` | **【4B内でガッチャンコ】**<br>Zeroのシステムデータと4Bの環境データを, 時間軸をピッタリ合わせて1レコードに結合。 |
-| **③ 可視化パブリッシュ**<br>(4B ➡️ クラウド) | ✨ **統一レポート形式**<br>(統合CSV / スプレッドシート) | `日時, 端末温度, 電池残量, 電波強度, 部屋温度, 部屋湿度` | **【スマホ閲覧の最適化】**<br>マスターがスマホで開いた瞬間に、すべてのコンディションが一画面で把握可能。 |
-
-
-### ▪️システム構成図
-graph TD
-    subgraph Zero2W["子機: Raspberry Pi Zero 2 W"]
-        Sensor["環境センサー<br/>(温湿度・気圧)"]
-    end
-
-    subgraph RPi4B["親機: Raspberry Pi 4B (192.168.0.19)"]
-        Flask["Flask Web API<br/>(app.py :8000)"]
-        DB[("SQLite DB<br/>(WALモード)")]
-    end
-
-    Sensor -->|"HTTP POST (JSON)<br/>X-API-Key"| Flask
-    Flask -->|"SQL INSERT"| DB
-
-### ▪️処理シーケンス図
-sequenceDiagram
-    autonumber
-    participant Z as Zero 2 W (子機)
-    participant F as Flask App (4B)
-    participant DB as SQLite DB
-
-    Z->>F: POST /api/v1/zero2w (JSON + API Key)
-    activate F
-    
-    alt 認証成功 (API Key一致)
-        F->>F: JST時刻 (received_at) 付与
-        F->>DB: INSERT (zero2w_logs)
-        F-->>Z: 200 OK (success)
-    else 認証エラー
-        F-->>Z: 403 Forbidden
-    end
-    
-    deactivate F
-
-### ▪️データ構造図
-erDiagram
-    zero2w_logs {
-        INTEGER id PK
-        TEXT device_id
-        TEXT timestamp
-        REAL temperature
-        REAL humidity
-        REAL pressure
-        REAL battery_voltage
-        REAL battery_percent
-        INTEGER wifi_rssi
-        TEXT status_code
-        TEXT received_at
-    }
+*最終更新: 2026-07-26*
