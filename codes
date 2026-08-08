@@ -1,0 +1,507 @@
+hideo_81_g@raspberrypi:~/workspace $ crontab -l
+# Edit this file to introduce tasks to be run by cron.
+# 
+# Each task to run has to be defined through a single line
+# indicating with different fields when the task will be run
+# and what command to run for the task
+# 
+# To define the time you can provide concrete values for
+# minute (m), hour (h), day of month (dom), month (mon),
+# and day of week (dow) or use '*' in these fields (for 'any').
+# 
+# Notice that tasks will be started based on the cron's system
+# daemon's notion of time and timezones.
+# 
+# Output of the crontab jobs (including errors) is sent through
+# email to the user the crontab file belongs to (unless redirected).
+# 
+# For example, you can run a backup of all your user accounts
+# at 5 a.m every week with:
+# 0 5 * * 1 tar -zcf /var/backups/home.tgz /home/
+# 
+# For more information see the manual pages of crontab(5) and cron(8)
+# 
+# m h  dom mon dow   command
+*/15 * * * * /usr/bin/python3 /home/hideo_81_g/workspace/ConditionLoggingSystem_v1.py >> /home/hideo_81_g/logs/cron_sensor.log 2>&1
+hideo_81_g@raspberrypi:~/workspace $ cat /home/hideo_81_g/workspace/ConditionLoggingSystem_v1.py
+#!/usr/bin/env python3
+"""
+ConditionLoggingSystem_v1.py  (4B 自測定 + 既存テキスト/rclone + SQLite)
+
+SensorCopier v6 系の挙動を維持したまま、rpi4b_logs への WAL 書き込みを追加する。
+SQLite の成否は本体（RAM / latest / rclone）を落とさない。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
+
+try:
+    import smbus
+except ImportError:
+    import smbus2 as smbus  # type: ignore
+
+# ---------------------------------------------------------------------------
+# 設定
+# ---------------------------------------------------------------------------
+__version__ = "1.0.0"
+
+LOG_DIR = "/home/hideo_81_g/logs"
+LOG_FILE = os.path.join(LOG_DIR, "condition_logging.log")
+
+DB_DIR = "/home/hideo_81_g/condition_logging"
+DB_PATH = os.path.join(DB_DIR, "condition_logging.db")
+DEVICE_ID = "rpi4b"  # Flask / zero2w 側と揃える
+
+RAM_DATA_DIR = "/dev/shm/sensor_data"
+PERSISTENT_DATA_DIR = "/home/hideo_81_g/sensor_data"
+LATEST_FILENAME = "latest_temp_humid.txt"
+
+IS_CI = os.getenv("GITHUB_ACTIONS") == "true" or os.getenv("CI") == "true"
+
+I2C_BUS = 1
+SENSOR_ADDRESS = 0x38
+TRIGGER_COMMAND = [0xAC, 0x33, 0x00]
+MAX_I2C_ERRORS = 3
+AHT25_STATUS_MASK = 0x18
+SENSOR_INIT_SLEEP = 0.1
+CONVERSION_SLEEP = 0.08
+
+FULL_SYNC_INTERVAL_HOURS = 4
+BW_LIMIT = "200k"
+JST = timezone(timedelta(hours=9), "JST")
+
+SQLITE_TIMEOUT_SEC = 10.0
+SQLITE_BUSY_TIMEOUT_MS = 10000
+
+i2c_error_count = 0
+
+# ---------------------------------------------------------------------------
+# ログ
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("CLS")
+logger.setLevel(logging.INFO)
+_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+if not logger.handlers:
+    if IS_CI:
+        _h = logging.StreamHandler(sys.stdout)
+    else:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        _h = RotatingFileHandler(LOG_FILE, maxBytes=1024 * 1024, backupCount=3)
+    _h.setFormatter(_formatter)
+    logger.addHandler(_h)
+
+# ---------------------------------------------------------------------------
+# 時刻・パス
+# ---------------------------------------------------------------------------
+def get_jst_now() -> datetime:
+    return datetime.now(JST)
+
+
+def get_monthly_filepath(base_dir: str) -> str:
+    month_str = get_jst_now().strftime("%Y-%m")
+    return os.path.join(base_dir, f"temp_humid_{month_str}.txt")
+
+
+# ---------------------------------------------------------------------------
+# SQLite（Flask と同じ DB / 同じ防御）
+# ---------------------------------------------------------------------------
+def _configure_sqlite_connection(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
+
+def init_db() -> None:
+    if IS_CI:
+        logger.info("[CI] DB init skipped")
+        return
+    try:
+        os.makedirs(DB_DIR, exist_ok=True)
+        with sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SEC) as conn:
+            _configure_sqlite_connection(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rpi4b_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT,
+                    created_at TEXT,
+                    temperature REAL,
+                    humidity REAL
+                )
+                """
+            )
+            conn.commit()
+        logger.info("SQLite ready (WAL, rpi4b_logs)")
+    except Exception as e:
+        logger.error("SQLite init failed: %s", e)
+
+
+def save_to_sqlite(created_at: str, temperature: float, humidity: float) -> bool:
+    """
+    rpi4b_logs へ INSERT。
+    失敗しても False を返すだけで、呼び出し側のテキスト/rclone は継続させる。
+    """
+    if IS_CI:
+        logger.info("[CI] SQLite save skipped: %s %s %s", created_at, temperature, humidity)
+        return True
+    if temperature is None or humidity is None:
+        logger.warning("SQLite skip: temperature/humidity is None")
+        return False
+
+    try:
+        os.makedirs(DB_DIR, exist_ok=True)
+        with sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SEC) as conn:
+            _configure_sqlite_connection(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rpi4b_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT,
+                    created_at TEXT,
+                    temperature REAL,
+                    humidity REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO rpi4b_logs (device_id, created_at, temperature, humidity)
+                VALUES (?, ?, ?, ?)
+                """,
+                (DEVICE_ID, created_at, float(temperature), float(humidity)),
+            )
+            conn.commit()
+        logger.info(
+            "SQLite rpi4b_logs OK: %s temp=%s hum=%s",
+            created_at,
+            temperature,
+            humidity,
+        )
+        return True
+    except Exception as e:
+        logger.error("SQLite rpi4b_logs failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# AHT25
+# ---------------------------------------------------------------------------
+def initialize_sensor(i2c_bus) -> bool:
+    try:
+        time.sleep(SENSOR_INIT_SLEEP)
+        status = i2c_bus.read_byte_data(SENSOR_ADDRESS, 0x71)
+        if (status & AHT25_STATUS_MASK) == AHT25_STATUS_MASK:
+            logger.info("AHT25 init OK")
+            return True
+        logger.warning("AHT25 init failed status=%s", hex(status))
+        return False
+    except OSError as e:
+        logger.error("AHT25 init error: %s", e)
+        return False
+
+
+def read_sensor_data(i2c_bus):
+    """
+    成功: (csv_line, created_at, temperature, humidity)
+    失敗: None
+    """
+    global i2c_error_count
+    try:
+        i2c_bus.write_i2c_block_data(SENSOR_ADDRESS, 0x00, TRIGGER_COMMAND)
+        time.sleep(CONVERSION_SLEEP)
+        data = i2c_bus.read_i2c_block_data(SENSOR_ADDRESS, 0x00, 7)
+
+        if (data[0] & AHT25_STATUS_MASK) != AHT25_STATUS_MASK:
+            raise ValueError(f"invalid status: {hex(data[0])}")
+
+        hum_raw = (data[1] << 12) | (data[2] << 4) | (data[3] >> 4)
+        tmp_raw = ((data[3] & 0x0F) << 16) | (data[4] << 8) | data[5]
+
+        humidity = round((hum_raw / 2**20) * 100, 1)
+        temperature = round((tmp_raw / 2**20) * 200 - 50, 1)
+
+        if not (0 <= humidity <= 100 and -40 <= temperature <= 80):
+            logger.warning("out of range: tmp=%s hum=%s", temperature, humidity)
+            return None
+
+        i2c_error_count = 0
+        created_at = get_jst_now().strftime("%Y-%m-%d %H:%M:%S")
+        csv_line = f"{created_at},tmp={temperature},hum={humidity}"
+        return csv_line, created_at, temperature, humidity
+
+    except (OSError, ValueError) as e:
+        i2c_error_count += 1
+        logger.error("I2C error (%s/%s): %s", i2c_error_count, MAX_I2C_ERRORS, e)
+        if i2c_error_count >= MAX_I2C_ERRORS:
+            logger.warning("re-init sensor after consecutive I2C errors")
+            initialize_sensor(i2c_bus)
+            i2c_error_count = 0
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ファイル / rclone / rsync（既存相当）
+# ---------------------------------------------------------------------------
+def execute_command(command, description, retries=3) -> bool:
+    for attempt in range(retries):
+        try:
+            subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=120,
+            )
+            logger.info("%s OK", description)
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error("%s timeout (%s/%s)", description, attempt + 1, retries)
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or "").strip()
+            logger.error("%s failed (%s/%s): %s", description, attempt + 1, retries, err)
+        if attempt < retries - 1:
+            time.sleep(2**attempt)
+    logger.critical("%s failed %s times", description, retries)
+    return False
+
+
+def needs_full_sync():
+    now = get_jst_now()
+    if now.hour % FULL_SYNC_INTERVAL_HOURS == 0 and 0 <= now.minute < 15:
+        return True, f"scheduled full sync ({FULL_SYNC_INTERVAL_HOURS}h)"
+    return False, ""
+
+
+def build_rclone_cmd(source, dest, is_file=True):
+    cmd = ["rclone", "copy", source, dest]
+    if is_file:
+        cmd.extend(["--checksum", "--no-traverse"])
+    cmd.extend(["--bwlimit", BW_LIMIT])
+    return cmd
+
+
+def flush_ram_to_persistent() -> bool:
+    logger.info("flush RAM %s -> %s", RAM_DATA_DIR, PERSISTENT_DATA_DIR)
+    cmd = ["rsync", "-a", RAM_DATA_DIR + "/", PERSISTENT_DATA_DIR + "/"]
+    return execute_command(cmd, "RAM to persistent rsync")
+
+
+def restore_ram_from_persistent() -> None:
+    monthly_ram = get_monthly_filepath(RAM_DATA_DIR)
+    monthly_persistent = get_monthly_filepath(PERSISTENT_DATA_DIR)
+    should_restore = (not os.path.exists(monthly_ram)) or (
+        os.path.exists(monthly_ram) and os.path.getsize(monthly_ram) == 0
+    )
+    if should_restore and os.path.exists(monthly_persistent):
+        logger.info("restore %s -> %s", monthly_persistent, monthly_ram)
+        try:
+            shutil.copy2(monthly_persistent, monthly_ram)
+        except Exception as e:
+            logger.error("restore failed: %s", e)
+
+
+def update_latest_file(monthly_filepath, latest_filepath, max_lines=32) -> bool:
+    lines = []
+    if os.path.exists(monthly_filepath):
+        try:
+            with open(monthly_filepath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            logger.error("read monthly failed: %s", e)
+            return False
+    target = lines[-max_lines:] if lines else []
+    temp_path = latest_filepath + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.writelines(target)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(temp_path, latest_filepath)
+        logger.info("latest updated (%s lines)", len(target))
+        return True
+    except Exception as e:
+        logger.error("latest update failed: %s", e)
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return False
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    logger.info("--- ConditionLoggingSystem v%s start ---", __version__)
+    start = time.perf_counter()
+    i2c = None
+
+    if not IS_CI:
+        os.makedirs(RAM_DATA_DIR, exist_ok=True)
+        os.makedirs(PERSISTENT_DATA_DIR, exist_ok=True)
+        init_db()
+
+    try:
+        try:
+            i2c = smbus.SMBus(I2C_BUS)
+            if not initialize_sensor(i2c):
+                logger.critical("sensor init failed; abort")
+                return
+        except FileNotFoundError:
+            logger.critical("I2C bus not found; abort")
+            return
+
+        restore_ram_from_persistent()
+        monthly_path_ram = get_monthly_filepath(RAM_DATA_DIR)
+        latest_filepath_ram = os.path.join(RAM_DATA_DIR, LATEST_FILENAME)
+        update_latest_file(monthly_path_ram, latest_filepath_ram, max_lines=32)
+
+        result = read_sensor_data(i2c)
+
+        if not result:
+            logger.warning("sensor read failed; skip write/upload/sqlite")
+        else:
+            csv_line, created_at, temperature, humidity = result
+
+            # A) 月次テキスト（先にRAMへ追記して保護）
+            monthly_path_ram = get_monthly_filepath(RAM_DATA_DIR)
+            with open(monthly_path_ram, "a", encoding="utf-8") as f:
+                f.write(csv_line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            logger.info("RAM monthly append: %s", csv_line)
+
+            # B) 自機データを DB へ保存
+            save_to_sqlite(created_at, temperature, humidity)
+
+            # C) 統合 latest ファイルを生成（show_latest.sh 呼出）
+            gen_ok = execute_command(
+                ["/home/hideo_81_g/workspace/show_latest.sh"],
+                "generate combined latest file",
+                retries=1
+            )
+
+            # D) 生成成功時のみ Google Drive へ送信
+            if gen_ok:
+                latest_filepath_ram = os.path.join(RAM_DATA_DIR, LATEST_FILENAME)
+                cmd = build_rclone_cmd(
+                    latest_filepath_ram, "raspi_data:/sensor_data/", is_file=True
+                )
+                execute_command(cmd, "combined latest rclone upload")
+            else:
+                logger.warning("latest generation failed; skip Drive upload this turn")
+
+        # 全体同期（既存）
+        need, reason = needs_full_sync()
+        if need:
+            logger.info("%s", reason)
+            if flush_ram_to_persistent():
+                cmd = build_rclone_cmd(
+                    PERSISTENT_DATA_DIR, "raspi_data:/sensor_data/", is_file=False
+                )
+                execute_command(cmd, "persistent dir rclone")
+            else:
+                logger.error("flush failed; skip full cloud sync")
+
+        logger.info("done in %.2fs", time.perf_counter() - start)
+
+    except Exception as e:
+        logger.critical("uncaught error: %s", e, exc_info=True)
+    finally:
+        if i2c is not None:
+            try:
+                i2c.close()
+            except Exception as e:
+                logger.error("I2C close error: %s", e)
+
+
+if __name__ == "__main__":
+    main()
+hideo_81_g@raspberrypi:~/workspace $ cat /home/hideo_81_g/workspace/show_latest.sh
+#!/bin/bash
+set -euo pipefail
+
+DB_PATH="/home/hideo_81_g/condition_logging/condition_logging.db"
+TARGET_FILE="/dev/shm/sensor_data/latest_temp_humid.txt"
+TMP_FILE="${TARGET_FILE}.tmp"
+DIR_NAME="$(dirname "$TARGET_FILE")"
+
+mkdir -p "$DIR_NAME"
+rm -f "$TMP_FILE"
+
+cleanup() {
+  rm -f "$TMP_FILE"
+}
+trap cleanup EXIT
+
+if [ ! -f "$DB_PATH" ]; then
+  echo "show_latest.sh: DB not found: $DB_PATH" >&2
+  exit 1
+fi
+
+# 1. DBから最新20件を抽出（5秒タイムアウト付き）
+sqlite3 -cmd ".timeout 5000" -header -column "$DB_PATH" "
+SELECT
+  device_id,
+  created_at,
+  temperature AS temp,
+  humidity AS hum,
+  pressure AS press,
+  battery_voltage AS batt_v,
+  battery_percent AS batt_p,
+  wifi_rssi AS wifi
+FROM (
+  SELECT
+    device_id,
+    created_at,
+    temperature,
+    humidity,
+    NULL AS pressure,
+    NULL AS battery_voltage,
+    NULL AS battery_percent,
+    NULL AS wifi_rssi
+  FROM rpi4b_logs
+  UNION ALL
+  SELECT
+    device_id,
+    COALESCE(received_at, timestamp) AS created_at,
+    temperature,
+    humidity,
+    pressure,
+    battery_voltage,
+    battery_percent,
+    wifi_rssi
+  FROM zero2w_logs
+)
+ORDER BY created_at DESC
+LIMIT 20;
+" > "$TMP_FILE"
+
+# 2. 0バイトチェック
+if [ ! -s "$TMP_FILE" ]; then
+  echo "show_latest.sh: empty output" >&2
+  exit 1
+fi
+
+# 3. ヘッダーのみ（データ行なし）チェック
+line_count="$(wc -l < "$TMP_FILE" | tr -d ' ')"
+if [ "$line_count" -lt 2 ]; then
+  echo "show_latest.sh: header only or too few lines ($line_count)" >&2
+  exit 1
+fi
+
+# 4. 安全に置換
+mv -f "$TMP_FILE" "$TARGET_FILE"
+trap - EXIT
+exit 0
+hideo_81_g@raspberrypi:~/workspace $ 
