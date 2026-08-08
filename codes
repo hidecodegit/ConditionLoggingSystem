@@ -22,7 +22,7 @@ hideo_81_g@raspberrypi:~/workspace $ crontab -l
 # For more information see the manual pages of crontab(5) and cron(8)
 # 
 # m h  dom mon dow   command
-*/15 * * * * /usr/bin/python3 /home/hideo_81_g/workspace/ConditionLoggingSystem_v1.py >> /home/hideo_81_g/logs/cron_sensor.log 2>&1
+1,16,31,46 * * * * /usr/bin/python3 /home/hideo_81_g/workspace/ConditionLoggingSystem_v1.py >> /home/hideo_81_g/logs/cron_sensor.log 2>&1
 hideo_81_g@raspberrypi:~/workspace $ cat /home/hideo_81_g/workspace/ConditionLoggingSystem_v1.py
 #!/usr/bin/env python3
 """
