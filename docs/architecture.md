@@ -51,13 +51,18 @@ graph TD
     Zero2W["RPi Zero 2 W (Tier 1: 計測専用)"]
     BME280["BME280"]
     Retry["retry_queue.db"]
+    RAM["/dev/shm (RAMディスク)"]
+    ShowLatest["show_latest.sh (検証)"]
 
     BME280 --> Zero2W
     AHT25 --> Pi4B
     Zero2W -->|"HTTP POST (成功時)"| Pi4B
     Zero2W -->|"失敗時"| Retry
     Retry -->|"復旧後リトライ"| Pi4B
-    Pi4B -->|"rclone"| Drive
+
+    Pi4B --> RAM
+    RAM --> ShowLatest
+    ShowLatest -->|"検証成功時のみ rclone"| Drive
 ```
 
 ## 3. データフロー詳細
@@ -72,13 +77,14 @@ graph TD
 6. 次回起動時または Wi-Fi 復旧検知時にリトライ
 
 ### 3.2 親機（Raspberry Pi 4B）処理フロー
-1. Flask アプリがポート 8000 で常駐
-2. 受信リクエストに対して:
-   - `X-API-Key` 認証
-   - 簡易バリデーション
-   - `zero2w_logs` テーブルへ INSERT
-3. 別プロセス（15分ごと）で 4B 自身のセンサー測定（AHT25） → `rpi4b_logs` へ直接書き込み
-4. 定期的に `rclone` で Google Drive へバックアップ
+1. Flask アプリがポート 8000 で常駐（Zero 2 W からの受信・`zero2w_logs` へ INSERT）
+2. 独立した Cron（毎時 1, 16, 31, 46 分）で `ConditionLoggingSystem_v1.py` が起動:
+   - 永続領域（`/home/.../sensor_data`）から `/dev/shm/sensor_data` へ必要に応じてリストア
+   - AHT25 から温湿度を取得
+   - `/dev/shm` 上の月次テキストファイルへ追記 ＋ `rpi4b_logs` DBへ INSERT (WAL)
+   - `show_latest.sh` を呼び出し、DBから過去データを集約・検証（0バイト/ヘッダのみ拒否、atomic mv）して `/dev/shm` に生成
+   - 検証成功時のみ `rclone` で Google Drive へアップロード
+3. 4時間ごとのウィンドウで `/dev/shm` から SDカード永続領域への `rsync`・バックアップを実行
 
 ## 4. タイミングと同時書き込みについて
 
@@ -116,6 +122,9 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 | **データベース** | 4B | 全データ一元集約 | SQLite3 (WAL) |
 | **4B自身の測定** | 4B | AHT25測定 → 直接DB書き込み | `smbus2` + `sqlite3` |
 | **クラウドバックアップ** | 4B | Googleドライブ同期 | `rclone` |
+| **作業領域（RAM）** | 4B | 頻繁なテキスト追記・一時ファイル生成 | /dev/shm/sensor_data (tmpfs) |
+| **安全公開パイプライン** | 4B | 0バイトチェック、原子更新、Drive同期 | show_latest.sh + rclone |
+| **永続ストレージ** | 4B | RAMから定期同期（4時間周期）されるバックアップ | /home/hideo_81_g/sensor_data |
 
 ## 6. 設計上の重要ポイント
 
@@ -176,8 +185,9 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 |---|---|---|
 | **Phase 0** | 準備（ディレクトリ作成・IP確認・APIキー決定） | 完了 |
 | **Phase 1** | 4B側 Flaskレシーバー作成・systemd常駐化 | 進行中 |
-| **Phase 2** | Zero 2 W側 送信ロジックをHTTPに一発切り替え（失敗時ローカル退避） | 未着手 |
-| **Phase 3** | 動作確認・完成 | 未着手 |
+| **Phase 2** | Zero 2 W側 送信ロジックをHTTPに一発切り替え（失敗時ローカル退避） | 完了 |
+| **Phase 3** | 4B作業領域の RAM化（/dev/shm）と show_latest 安全公開 | 完了 |
+| **Phase 4** | 二重書き（テキスト＋DB）の解消・DB完全正本化（To-Be） | 未着手 |
 
 ### 変更量のイメージ
 
@@ -340,7 +350,52 @@ F1 は単発の読み取り失敗、F2 は固着により欠測が持続する�
   - **4B**: 欠けたデータも受け取り、続きすぎたら気づく
 - 今回の BME280 知見は F2 の具体策であり、システム全体の原則（部分欠測の許容と役割分担）に従属させる
 
+## 11. SysML 構造モデル (As-Is / To-Be)
+
+本システムの構造および拡張指針を、SysML 形式（DSL表記）で定義する。
+
+### 11.1 As-Is（現行アーキテクチャ）
+
+```sysml
+bdd CLS_AsIs_Architecture
+
+<> RPi4B_MasterNode
+  parts:
+    - sensor      : AHT25_Sensor [1]
+    - ingestApi   : FlaskReceiverApp [1]       // :8000 常駐
+    - selfLogger  : ConditionLoggingSystem_v1 [1] // cron: 1,16,31,46 * * * *
+    - database    : SQLite_Database [1]        // WAL + busy_timeout
+    - workDir     : ShmSensorData [1]          // /dev/shm/sensor_data (tmpfs)
+    - persistent  : PersistentSensorData [1]   // /home/.../sensor_data (4h rsync)
+    - publisher   : ShowLatestThenRclone [1]   // show_latest.sh (検証付き)
+
+<> Zero2W_SubNode
+  parts:
+    - sensor      : BME280_Sensor [1]
+    - senderApp   : PiPulseMain [1]            // HTTP POST
+    - queueStorage: LocalQueueStorage [1]      // retry_queue.db
+```
 -----
 
+### 11.2 To-Be（将来の目指す姿）
+
+```sysml
+bdd CLS_ToBe_Architecture
+
+<> ConditionLoggingSystem
+  parts:
+    - edge : EdgeNode [1..*]       // 複数子機対応（属性で識別）
+    - hub  : HubNode [1]           // DBを唯一の正本とする
+    - cloud: CloudArchive [0..1]
+
+<> HubNode
+  parts:
+    - ingestApi   : IngestAPI [1]
+    - database    : SystemOfRecordDB [1]      // テキスト保存を完全廃止・DB一本化
+    - publish     : PublishService [1]
+  constraints:
+    - workingStore is volatile (tmpfs)
+    - concurrent writers use WAL + busy timeout
+```
 ---
-*最終更新: 2026-08-01*
+*最終更新: 2026-08-12*
