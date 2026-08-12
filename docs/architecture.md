@@ -45,23 +45,31 @@ graph TD
 ### After（Flask版）
 ```mermaid
 graph TD
+    subgraph Zero2W ["RPi Zero 2 W (Tier 1: 計測専用)"]
+        BME280["BME280"] --> ZeroApp["PiPulseMain"]
+        ZeroApp -->|"通信失敗時"| Queue["/tmp/pipulse_queue\n(local_queue.py / RAM)"]
+        Queue -->|"復旧後リトライ"| ZeroApp
+    end
+
+    subgraph Pi4B ["RPi 4B (Tier 2: 集約・バックアップ)"]
+        Flask["Flask Receiver (:8000)"]
+        DB[(SQLite DB\nWAL Mode)]
+        Cron["4B Cron\n(ConditionLoggingSystem_v1.py)"]
+        AHT25["AHT25"]
+        Shm["/dev/shm/sensor_data\n(tmpfs RAM)"]
+        ShowLatest["show_latest.sh\n(DB集約・0バイト検証)"]
+
+        ZeroApp -->|"HTTP POST (成功時)"| Flask
+        Flask -->|"INSERT zero2w_logs"| DB
+        
+        AHT25 --> Cron
+        Cron -->|"月次テキスト追記"| Shm
+        Cron -->|"INSERT rpi4b_logs"| DB
+        DB -->|"過去データ集約"| ShowLatest
+        ShowLatest -->|"latestファイル生成"| Shm
+    end
+
     Drive["Google Drive"]
-    Pi4B["RPi 4B (Tier 2: Flask + SQLite)"]
-    AHT25["AHT25"]
-    Zero2W["RPi Zero 2 W (Tier 1: 計測専用)"]
-    BME280["BME280"]
-    Retry["retry_queue.db"]
-    RAM["/dev/shm (RAMディスク)"]
-    ShowLatest["show_latest.sh (検証)"]
-
-    BME280 --> Zero2W
-    AHT25 --> Pi4B
-    Zero2W -->|"HTTP POST (成功時)"| Pi4B
-    Zero2W -->|"失敗時"| Retry
-    Retry -->|"復旧後リトライ"| Pi4B
-
-    Pi4B --> RAM
-    RAM --> ShowLatest
     ShowLatest -->|"検証成功時のみ rclone"| Drive
 ```
 
@@ -72,8 +80,8 @@ graph TD
    - 失敗時: ソフトリセット後に再試行1回。それでも失敗なら null として続行
 2. バッテリー・RSSI 等、取得できるメトリクスは欠測と独立に取得
 3. 親機へ HTTP POST を試行（`X-API-Key` ヘッダ付き）
-4. **成功時**: 何もローカルに残さず終了（SDカード保護）
-5. **失敗時**: `retry_queue.db` にレコードを退避
+4. **成功時**: SDカードへの書き込みは行わず終了（※動作確認用に /tmp/latest_pipulse.txt などの揮発キャッシュを残すのみ）。
+5. **失敗時**: /tmp/pipulse_queue（RAM上のローカルキュー）へペイロードを退避。
 6. 次回起動時または Wi-Fi 復旧検知時にリトライ
 
 ### 3.2 親機（Raspberry Pi 4B）処理フロー
@@ -116,7 +124,7 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 | コンポーネント | 場所 | 役割 | 使用技術 |
 |---|---|---|---|
 | **センサー読み取り** | Zero 2 W | BME280からデータ取得 | `smbus2` |
-| **ローカル退避** | Zero 2 W | 通信失敗時の安全保管 | SQLite3 (WAL) |
+| **ローカル退避** | Zero 2 W | 通信失敗時の安全保管（RAM上保管） | /tmp/pipulse_queue (local_queue.py) |
 | **送信クライアント** | Zero 2 W | 4Bへデータ送信 | `requests` / `urllib` |
 | **レシーバー** | 4B | データ受信窓口 | Flask |
 | **データベース** | 4B | 全データ一元集約 | SQLite3 (WAL) |
@@ -184,7 +192,7 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 | Phase | 内容 | 状態 |
 |---|---|---|
 | **Phase 0** | 準備（ディレクトリ作成・IP確認・APIキー決定） | 完了 |
-| **Phase 1** | 4B側 Flaskレシーバー作成・systemd常駐化 | 進行中 |
+| **Phase 1** | 4B側 Flaskレシーバー作成・systemd常駐化 | 完了 |
 | **Phase 2** | Zero 2 W側 送信ロジックをHTTPに一発切り替え（失敗時ローカル退避） | 完了 |
 | **Phase 3** | 4B作業領域の RAM化（/dev/shm）と show_latest 安全公開 | 完了 |
 | **Phase 4** | 二重書き（テキスト＋DB）の解消・DB完全正本化（To-Be） | 未着手 |
@@ -193,19 +201,16 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 
 | 対象 | 変更の大きさ | 内容 |
 |---|---|---|
-| **4B SensorCopier** | ほぼゼロ | 触らない |
-| **4B 新規Flask** | 新規作成 | 受信専用 |
-| **Zero 2 W main.py / storage.py** | 小〜中 | 送信部分にHTTPを追加 |
+| **4B 自測定プログラム** | 中 | ConditionLoggingSystem_v1.py に整理・/dev/shm＋WAL SQLite＋show_latest.sh 連携へ刷新 |
+| **4B 新規Flask** | 新規作成 | 受信専用レシーバ（:8000常駐） |
+| **Zero 2 W 送信ロジック** | 小〜中 | 送信部分に HTTP POST ＋ /tmp キュー退避を追加 |
 | **Zero 2 W 測定ロジック** | ゼロ | 触らない |
 
 ## 9. 今後の実装優先順位
 
-1. 4B側 Flask レシーバーの systemd 常駐化完了
-2. Zero 2 W側 送信＋リトライキュー実装
-3. 4B自身の測定データを同じDBに統合（任意）
-4. rclone によるDBバックアップ整備
-5. システムメトリクス（バッテリー・RSSI）の追加
-6. 統合レポート・可視化（必要に応じて）
+現行システム（Phase 1〜3）の運用安定化とログ監視
+システムメトリクス（バッテリー・RSSI）の可視化・アラート設定（ペイロード受取済）
+テキスト保存の縮小と DB 完全正本化（To-Be スタイルへの移行検討）
 
 ## 10. 耐障害モデル
 
@@ -357,9 +362,10 @@ F1 は単発の読み取り失敗、F2 は固着により欠測が持続する�
 ### 11.1 As-Is（現行アーキテクチャ）
 
 ```sysml
+// Note: 近未来改善（/dev/shm 化・show_latest 安全公開）はすべて実装完了し、As-Is に吸収済み。
 bdd CLS_AsIs_Architecture
 
-<> RPi4B_MasterNode
+<<block>> RPi4B_MasterNode
   parts:
     - sensor      : AHT25_Sensor [1]
     - ingestApi   : FlaskReceiverApp [1]       // :8000 常駐
@@ -369,7 +375,7 @@ bdd CLS_AsIs_Architecture
     - persistent  : PersistentSensorData [1]   // /home/.../sensor_data (4h rsync)
     - publisher   : ShowLatestThenRclone [1]   // show_latest.sh (検証付き)
 
-<> Zero2W_SubNode
+<<block>> Zero2W_SubNode
   parts:
     - sensor      : BME280_Sensor [1]
     - senderApp   : PiPulseMain [1]            // HTTP POST
@@ -382,13 +388,13 @@ bdd CLS_AsIs_Architecture
 ```sysml
 bdd CLS_ToBe_Architecture
 
-<> ConditionLoggingSystem
+<<block>> ConditionLoggingSystem
   parts:
     - edge : EdgeNode [1..*]       // 複数子機対応（属性で識別）
     - hub  : HubNode [1]           // DBを唯一の正本とする
     - cloud: CloudArchive [0..1]
 
-<> HubNode
+<<block>> HubNode
   parts:
     - ingestApi   : IngestAPI [1]
     - database    : SystemOfRecordDB [1]      // テキスト保存を完全廃止・DB一本化
