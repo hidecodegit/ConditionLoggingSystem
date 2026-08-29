@@ -16,7 +16,7 @@
 
 役割を完全分離した **2-Tier 構成** に移行。
 
-- **子機（Zero 2 W）**: 計測専用。通信成功時はSD書き込みゼロ、失敗時のみローカルSQLite退避
+- **子機（Zero 2 W）**: 計測専用。通信成功時はアプリ独自のSD書き込みゼロ、失敗時のみローカルRAM退避
 - **親機（Raspberry Pi 4B）**: 常駐Flaskサーバーで受信・集約・バックアップを担当
 
 ---
@@ -80,8 +80,8 @@ graph TD
    - 失敗時: ソフトリセット後に再試行1回。それでも失敗なら null として続行
 2. バッテリー・RSSI 等、取得できるメトリクスは欠測と独立に取得
 3. 親機へ HTTP POST を試行（`X-API-Key` ヘッダ付き）
-4. **成功時**: SDカードへの書き込みは行わず終了（※動作確認用に /tmp/latest_pipulse.txt などの揮発キャッシュを残すのみ）。
-5. **失敗時**: /tmp/pipulse_queue（RAM上のローカルキュー）へペイロードを退避。
+4. **成功時**: アプリ独自によるSDカードへのデータ書き込みは行わず終了（※動作確認用に /tmp/latest_pipulse.txt などの揮発キャッシュを残すのみ）。
+5. **失敗時**: /tmp/pipulse_queue（RAM上のJSONファイル）へペイロードを退避。
 6. 次回起動時または Wi-Fi 復旧検知時にリトライ
 
 ### 3.2 親機（Raspberry Pi 4B）処理フロー
@@ -96,7 +96,7 @@ graph TD
 
 ## 4. タイミングと同時書き込みについて
 
-Zero 2 W と 4B は **独立したタイマー** で動作しており、時刻同期は NTP 依存（完全同期ではない）。
+Zero 2 W と 4B は **独立したタイマー** で動作しており、時刻同期は NTP 依存（完全同期ではない。Zero 2 W は RTC を持たないため、ネット未接続起動時は時刻が不正確になるリスクがある）。
 
 | パターン | 状況 | 影響 | 対策 |
 |---|---|---|---|
@@ -249,7 +249,7 @@ F1 は単発の読み取り失敗、F2 は固着により欠測が持続する�
 |------|------------------------------|--------------------------------------------|
 | F1 | 失敗しても他メトリクスは取得して送る | partial なペイロードを受け入れる（null 可） |
 | F2 | **同一起動内**でソフトリセット＋再試行を行う | 連続 null を検知し、ログまたはフラグに残す |
-| F3 | HTTP 失敗時は `retry_queue` に退避し、後で再送 | Flask 常駐で受信し、届いたら保存 |
+| F3 | HTTP 失敗時は `/tmp/pipulse_queue` に退避し、後で再送 | Flask 常駐で受信し、届いたら保存 |
 | F4 | （送り側のため主担当外） | WAL + `busy_timeout`（必要なら短いリトライ） |
 | F5 | 成功時は SD 書き込みをほぼゼロ。失敗時のみ queue | 既存の RAM / 永続化方針を維持 |
 | F6 | 重いクラウド送信を載せない。1起動の最大実行時間を設ける | 集約と rclone を担当し、エッジに負荷を戻さない |
@@ -375,7 +375,7 @@ bdd CLS_AsIs_Architecture
     - persistent  : PersistentSensorData [1]   // /home/.../sensor_data (4h rsync)
     - publisher   : ShowLatestThenRclone [1]   // show_latest.sh (検証付き)
 
-<<<block>> Zero2W_SubNode
+<<block>> Zero2W_SubNode
   parts:
     - sensor      : BME280_Sensor [1]
     - senderApp   : PiPulseMain [1]            // HTTP POST
@@ -404,4 +404,4 @@ bdd CLS_ToBe_Architecture
     - concurrent writers use WAL + busy timeout
 ```
 ---
-*最終更新: 2026-08-12*
+*最終更新: 2026-08-29*
