@@ -47,7 +47,7 @@ graph TD
 graph TD
     subgraph Zero2W ["RPi Zero 2 W (Tier 1: 計測専用)"]
         BME280["BME280"] --> ZeroApp["PiPulseMain"]
-        ZeroApp -->|"通信失敗時"| Queue["/tmp/pipulse_queue\n(local_queue.py / RAM)"]
+        ZeroApp -->|"通信失敗時"| Queue["/tmp/pipulse_queue/*.json\n(local_queue.py / RAM)"]
         Queue -->|"復旧後リトライ"| ZeroApp
     end
 
@@ -124,7 +124,7 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 | コンポーネント | 場所 | 役割 | 使用技術 |
 |---|---|---|---|
 | **センサー読み取り** | Zero 2 W | BME280からデータ取得 | `smbus2` |
-| **ローカル退避** | Zero 2 W | 通信失敗時の安全保管（RAM上保管） | /tmp/pipulse_queue (local_queue.py) |
+| **ローカル退避** | Zero 2 W | 通信失敗時の安全保管（RAM上JSON） | /tmp/pipulse_queue/*.json (local_queue.py) |
 | **送信クライアント** | Zero 2 W | 4Bへデータ送信 | `requests` / `urllib` |
 | **レシーバー** | 4B | データ受信窓口 | Flask |
 | **データベース** | 4B | 全データ一元集約 | SQLite3 (WAL) |
@@ -138,12 +138,12 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 
 - **センサー構成**: Zero 2 W = BME280（温度・湿度・気圧） / 4B = AHT25（温度・湿度）
 - **SDカード保護**: 
-  - Zero 2 W → 成功時は書き込みゼロ（失敗時のみローカルSQLiteへ退避）
+  - Zero 2 W → 送信成功時はアプリ独自の永続SD書き込みゼロ（OSの標準journalログ等を除く。失敗時のみ /tmp へ退避）
   - 4B自炊データ → HTTPを経由せず直接DB書き込み（無駄なオーバーヘッド排除）
 - **DB安全性**: WALモード + `busy_timeout` + `synchronous=NORMAL` で同時書き込みに備える
 - **拡張性**: `device_id` カラムで複数子機を区別可能
 - **認証**: シンプルな `X-API-Key` 方式（同一LAN内運用を前提）
-- **耐障害性**: 通信断が発生してもデータ消失ゼロ ※耐障害性に関してセクション10を参照。
+- **耐障害性**: 通信断時も RAM（/tmp）へ一時退避（※SDカード寿命保護のため、電源断・再起動時の揮発を許容する設計）
 - **システムメトリクス**: バッテリー・RSSI等は次ステップ（まずは3点連携を優先）
 
 ## 7. データベース設計（概要）
@@ -379,7 +379,7 @@ bdd CLS_AsIs_Architecture
   parts:
     - sensor      : BME280_Sensor [1]
     - senderApp   : PiPulseMain [1]            // HTTP POST
-    - queueStorage: LocalQueueStorage [1]      // retry_queue.db
+    - queueStorage: LocalQueueStorage [1]      // /tmp/pipulse_queue/*.json
 ```
 -----
 
