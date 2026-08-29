@@ -138,12 +138,12 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 
 - **センサー構成**: Zero 2 W = BME280（温度・湿度・気圧） / 4B = AHT25（温度・湿度）
 - **SDカード保護**: 
-  - Zero 2 W → 送信成功時はアプリ独自の永続SD書き込みゼロ（OSの標準journalログ等を除く。失敗時のみ /tmp へ退避）
+  - Zero 2 W → 送信成功時はアプリ独自の永続データ書き込みゼロ（通信失敗時のみ /tmp へ退避。※OSレベルではトラブルシューティング用に systemd-journald ログを上限100MBで永続保存）
   - 4B自炊データ → HTTPを経由せず直接DB書き込み（無駄なオーバーヘッド排除）
 - **DB安全性**: WALモード + `busy_timeout` + `synchronous=NORMAL` で同時書き込みに備える
 - **拡張性**: `device_id` カラムで複数子機を区別可能
 - **認証**: シンプルな `X-API-Key` 方式（同一LAN内運用を前提）
-- **耐障害性**: 通信断時も RAM（/tmp）へ一時退避（※SDカード寿命保護のため、電源断・再起動時の揮発を許容する設計）
+- **耐障害性**: 通信断時も RAM（/tmp）へ一時退避（※SDカード寿命保護を優先するため、電源断・再起動時の未再送データ揮発を許容する設計）
 - **システムメトリクス**: バッテリー・RSSI等は次ステップ（まずは3点連携を優先）
 
 ## 7. データベース設計（概要）
@@ -375,7 +375,7 @@ bdd CLS_AsIs_Architecture
     - persistent  : PersistentSensorData [1]   // /home/.../sensor_data (4h rsync)
     - publisher   : ShowLatestThenRclone [1]   // show_latest.sh (検証付き)
 
-<<block>> Zero2W_SubNode
+<<<block>> Zero2W_SubNode
   parts:
     - sensor      : BME280_Sensor [1]
     - senderApp   : PiPulseMain [1]            // HTTP POST
